@@ -75,7 +75,12 @@ def fetch_live():
     resp.raise_for_status()
     if not resp.text.startswith('enc5:'):
         raise RuntimeError('Unexpected response (not enc5)')
-    decoded = find_decoder()(resp.text)
+    try:
+        decoded = find_decoder()(resp.text)
+    except Exception as exc:
+        raise RuntimeError(
+            f"ENC5_DECODE_FAILED: {type(exc).__name__}: {exc}"
+        ) from exc
     if not isinstance(decoded, dict) or not all(k in decoded for k in ('자료109','자료126','자료178')):
         raise RuntimeError('Decoder returned unexpected data; aborting sheet write')
     if decoded.get('학교명') and '휘문' not in str(decoded['학교명']):
