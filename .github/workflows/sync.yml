@@ -3,29 +3,13 @@ name: Comcigan Timetable Sync
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "30 6 * * 1-5"
-      timezone: "Asia/Seoul"
+  push:
+    branches:
+      - main
 
 jobs:
-  sync:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Fetch timetable
-        run: npm run sync
-        env:
-          GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      - name: Check workflow
+        run: echo "GitHub Actions 정상 작동"
