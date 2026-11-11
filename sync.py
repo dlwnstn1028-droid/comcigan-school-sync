@@ -108,10 +108,22 @@ def sheets_session():
     return AuthorizedSession(creds)
 
 
+
 def request_checked(session, method, url, **kwargs):
     r = session.request(method, url, timeout=30, **kwargs)
+
+    if not r.ok:
+        try:
+            err = r.json().get("error", {})
+            print("Google API 오류 코드:", err.get("code"))
+            print("Google API 오류 사유:", err.get("status"))
+            print("Google API 메시지:", err.get("message"))
+        except ValueError:
+            print("Google API 응답을 해석할 수 없습니다.")
+
     r.raise_for_status()
     return r.json() if r.content else {}
+
 
 
 def write_tabs(now, rows, status):
