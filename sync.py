@@ -3,26 +3,17 @@
 Does NOT write to Google Calendar. Unverified live changes are never promoted
 as confirmed personal timetable. No NEIS calls are made.
 """
-import base64
-import importlib
 import json
 import os
-import pkgutil
-import re
 import sys
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
-import requests
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 
 KST = timezone(timedelta(hours=9))
 SCHOOL_ID = 69622
 SHEET_ID = os.getenv('TIMETABLE_SHEET_ID', '')
-BASE = 'http://comci.net:4082'
-ENDPOINT = '666823'  # last observed; may change
-PREFIX = '18066_'   # last observed; may change
 
 REGULAR = [
  ['체육(문지혜)','물리학실험( )','문학B(최홍준)','영어B(정의석)','화학(이규희)','미적1(박희선)'],
@@ -36,56 +27,35 @@ OVERRIDES = {'2026-11-12': {4:'영어A(정의석)',5:'문학A(이현익)'}}
 NO_CLASS = {'2026-11-19'}
 
 
-def find_decoder():
-    """Find decoder already used in previous Colab tests (pycomcigan)."""
-    package = importlib.import_module('pycomcigan')
-    modules = [package]
-    if hasattr(package, '__path__'):
-        for info in pkgutil.walk_packages(package.__path__, package.__name__ + '.'):
-            try:
-                modules.append(importlib.import_module(info.name))
-            except (ImportError, RuntimeError):
-                pass
-    for mod in modules:
-        fn = getattr(mod, 'decode_response', None)
-        if callable(fn):
-            return fn
-    raise RuntimeError('pycomcigan decode_response not found; check package version')
-
-
 def fetch_live():
-    s = requests.Session()
-    s.headers.update({'User-Agent':'Mozilla/5.0','Referer':BASE+'/st'})
-    # Discover from the live page if available; never claim discovery when fallback used.
-    endpoint, prefix = ENDPOINT, PREFIX
+    """Read a live timetable using upstream's complete enc5 protocol.
+
+    The maintained TimeTable client discovers rotating endpoints, request
+    tokens and the AES/HMAC key from the service page. Calling decode_response
+    without that key fails even when the HTTP request returned 200.
+    """
+    from pycomcigan import TimeTable
+
+    table = TimeTable('휘문고등학교', school_code=SCHOOL_ID, week_num=0)
+    if int(table.school_code) != SCHOOL_ID or '휘문' not in table.school_name:
+        raise RuntimeError('Comcigan school identity mismatch')
+
     try:
-        html = s.get(BASE+'/st', timeout=12).text
-        match = re.search(r"sc_data\s*\(\s*['\"](\d+_)['\"]", html)
-        if match:
-            prefix = match.group(1)
-        match = re.search(r"(?:4082/|['\"]/)\s*(\d{5,6})(?:\?|['\"])", html)
-        if match:
-            endpoint = match.group(1)
-    except requests.RequestException:
-        pass
-    # Week selector 0 was observed, but its date semantics have not been proven.
-    query = base64.b64encode(f'{prefix}{SCHOOL_ID}_0_0_enc5'.encode()).decode()
-    url = f'{BASE}/{endpoint}?{quote(query, safe="")}'
-    resp = s.get(url, timeout=25)
-    resp.raise_for_status()
-    if not resp.text.startswith('enc5:'):
-        raise RuntimeError('Unexpected response (not enc5)')
-    try:
-        decoded = find_decoder()(resp.text)
-    except Exception as exc:
-        raise RuntimeError(
-            f"ENC5_DECODE_FAILED: {type(exc).__name__}: {exc}"
-        ) from exc
-    if not isinstance(decoded, dict) or not all(k in decoded for k in ('자료109','자료126','자료178')):
-        raise RuntimeError('Decoder returned unexpected data; aborting sheet write')
-    if decoded.get('학교명') and '휘문' not in str(decoded['학교명']):
-        raise RuntimeError('School mismatch; aborting sheet write')
-    return decoded
+        lessons = table.timetable[2][6]
+    except (IndexError, TypeError, KeyError) as exc:
+        raise RuntimeError('Grade 2 class 6 timetable missing') from exc
+    if not isinstance(lessons, list) or len(lessons) < 6:
+        raise RuntimeError('Unexpected class timetable structure')
+
+    # Class timetable consists of day 0 placeholder, then Monday-Friday.
+    count = sum(
+        1 for day in lessons[1:6] for lesson in day
+        if getattr(lesson, 'subject', '')
+    )
+    if count < 20:
+        raise RuntimeError(f'Unexpectedly sparse live timetable ({count} lessons)')
+    return {'school': table.school_name, 'class': (2, 6),
+            'lessons': lessons, 'lesson_count': count}
 
 
 def regular_rows(now):
@@ -103,6 +73,24 @@ def regular_rows(now):
     return rows
 
 
+
+def live_rows(now, data):
+    """Raw homeroom timetable; never equate homeroom electives with personal classes."""
+    monday = now.date() - timedelta(days=now.weekday())
+    out = []
+    for i, day in enumerate(data['lessons'][1:6]):
+        ds = (monday + timedelta(days=i)).isoformat()
+        for item in day[:7]:
+            subject = getattr(item, 'subject', '') or ''
+            teacher = getattr(item, 'teacher', '') or ''
+            orig = getattr(item, 'original', None)
+            original_subject = (getattr(orig, 'subject', '') or '') if orig else ''
+            original_teacher = (getattr(orig, 'teacher', '') or '') if orig else ''
+            out.append([ds, '월화수목금'[i], int(item.period), subject,
+                        teacher, original_subject, original_teacher,
+                        'YES' if getattr(item, 'replaced', False) else 'NO'])
+    return out
+
 def sheets_session():
     raw = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
     if not raw or not SHEET_ID:
@@ -113,50 +101,51 @@ def sheets_session():
     return AuthorizedSession(creds)
 
 
-
 def request_checked(session, method, url, **kwargs):
     r = session.request(method, url, timeout=30, **kwargs)
-
-    if not r.ok:
-        try:
-            err = r.json().get("error", {})
-            print("Google API 오류 코드:", err.get("code"))
-            print("Google API 오류 사유:", err.get("status"))
-            print("Google API 메시지:", err.get("message"))
-        except ValueError:
-            print("Google API 응답을 해석할 수 없습니다.")
-
     r.raise_for_status()
     return r.json() if r.content else {}
 
 
-
-def write_tabs(now, rows, status):
+def write_tabs(now, rows, status, live=None):
     session = sheets_session()
     root = f'https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}'
-    meta = request_checked(session,'GET',root,params={'fields':'sheets.properties(title)'})
-    existing = {x['properties']['title'] for x in meta.get('sheets',[])}
-    names = ['개인기준시간표','컴시간조회상태']
+    meta = request_checked(session, 'GET', root,
+                           params={'fields': 'sheets.properties(title)'})
+    existing = {x['properties']['title'] for x in meta.get('sheets', [])}
+    names = ['개인기준시간표', '컴시간조회상태', '컴시간원본']
     missing = [n for n in names if n not in existing]
     if missing:
-        request_checked(session,'POST',root+':batchUpdate',json={
-            'requests':[{'addSheet':{'properties':{'title':n}}} for n in missing]
+        request_checked(session, 'POST', root+':batchUpdate', json={
+            'requests': [{'addSheet': {'properties': {'title': n}}} for n in missing]
         })
     stamp = now.isoformat(timespec='seconds')
+    raw_rows = live or []
     payload = {
-      'valueInputOption':'RAW',
-      'data':[
-        {'range':"'개인기준시간표'!A1:G100",'values':[
-          ['날짜','요일','교시','시작','종료','개인 과목','검증 상태'],*rows]},
-        {'range':"'컴시간조회상태'!A1:B10",'values':[
-          ['항목','값'],['조회 시각(KST)',stamp],['결과',status],
-          ['학교코드',str(SCHOOL_ID)],['컴시간 변경사항 적용','아니오 (미검증)'],
-          ['캘린더 변경','없음']]}]
+      'valueInputOption': 'RAW',
+      'data': [
+        {'range': "'개인기준시간표'!A1:G100", 'values': [
+          ['날짜', '요일', '교시', '시작', '종료', '개인 과목', '검증 상태'], *rows]},
+        {'range': "'컴시간조회상태'!A1:B10", 'values': [
+          ['항목', '값'], ['조회 시각(KST)', stamp], ['결과', status],
+          ['학교코드', str(SCHOOL_ID)],
+          ['컴시간 변경사항 자동적용', '아니오 (이동수업 매핑 미검증)'],
+          ['캘린더 변경', '없음'],
+          ['컴시간 원본 수업 수', str(sum(bool(row[3]) for row in raw_rows))]]},
+        {'range': "'컴시간원본'!A1:H100", 'values': [
+          ['날짜','요일','교시','6반 과목','6반 교사','이전 과목','이전 교사','변경 표시'],
+          *raw_rows]}
+      ]
     }
-    # Clear only automation-owned tabs, NEVER the existing original '시간표' tab.
-    for n in names:
-        request_checked(session,'POST',root+f"/values/'{n}'!A1:Z500:clear",json={})
-    request_checked(session,'POST',root+'/values:batchUpdate',json=payload)
+    # Preserve prior successful live snapshot when live fetch fails.
+    # No data from a failed fetch is ever silently presented as new live data.
+    for n in ['개인기준시간표', '컴시간조회상태']:
+        request_checked(session, 'POST', root+f"/values/'{n}'!A1:Z500:clear", json={})
+    if live is not None:
+        request_checked(session, 'POST', root+"/values/'컴시간원본'!A1:Z500:clear", json={})
+    if live is None:
+        payload['data'] = payload['data'][:2]
+    request_checked(session, 'POST', root+'/values:batchUpdate', json=payload)
 
 
 def main():
@@ -168,12 +157,15 @@ def main():
     try:
         data = fetch_live()
         status = 'ENC5_DECODED_UNMAPPED'
-        print('Comcigan decoded. Keys:', ', '.join(k for k in ('자료109','자료126','자료178') if k in data))
+        live = live_rows(now, data)
+        print('Comcigan enc5 decoded; class:', data['class'],
+              'lessons:', data['lesson_count'])
     except Exception as e:
+        live = None
         status = 'FETCH_FAILED: '+type(e).__name__
         print('Live fetch not verified:', repr(e), file=sys.stderr)
     # Baseline and status only. No unverified substitutions or calendar writes.
-    write_tabs(now, rows, status)
+    write_tabs(now, rows, status, live)
     print(f'Updated safe staging tabs; status={status}; baseline rows={len(rows)}')
     if status.startswith('FETCH_FAILED'):
         raise RuntimeError('Live Comcigan fetch failed; staging marked accordingly')
