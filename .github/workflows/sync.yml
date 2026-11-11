@@ -1,25 +1,31 @@
 
-name: Comcigan Timetable Sync
+name: Comcigan timetable fetch
 
 on:
   workflow_dispatch:
+  schedule:
+    # 한국시간 평일 오전 6시 20분
+    - cron: '20 21 * * 0-4'
+
+permissions:
+  contents: read
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: '22'
+          python-version: '3.11'
+          cache: pip
 
-      - name: Install dependencies
-        run: npm install
+      - run: pip install -r requirements.txt
 
-      - name: Fetch timetable
-        run: npm run sync
+      - name: Fetch and stage timetable
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TIMETABLE_SHEET_ID: ${{ secrets.TIMETABLE_SHEET_ID }}
+        run: python sync.py
