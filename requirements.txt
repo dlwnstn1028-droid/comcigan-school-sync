@@ -1,3 +1,5 @@
 requests>=2.32,<3
-pycomcigan
+
+git+https://github.com/hegelty/pycomcigan.git
+
 google-auth>=2.30,<3
