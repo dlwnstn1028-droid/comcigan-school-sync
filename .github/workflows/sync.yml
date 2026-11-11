@@ -3,13 +3,23 @@ name: Comcigan Timetable Sync
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
-  test:
+  sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Check workflow
-        run: echo "GitHub Actions 정상 작동"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Fetch timetable
+        run: npm run sync
