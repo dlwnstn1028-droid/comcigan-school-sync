@@ -7,6 +7,7 @@ NEIS is not accessed. A failed week never overwrites its last successful snapsho
 """
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -19,20 +20,6 @@ KST = timezone(timedelta(hours=9))
 SCHOOL_ID = 69622
 SHEET_ID = os.getenv('TIMETABLE_SHEET_ID', '')
 
-REGULAR = [
-    ['체육(문지혜)', '물리학실험( )', '문학B(최홍준)', '영어B(정의석)', '화학(이규희)', '미적1(박희선)'],
-    ['미적1(박희선)', '교양3(이윤정)', '화학(이규희)', '물리(이창학)', '영어B(정의석)', '기하(우안성)', '생각2(정의석)'],
-    ['기하(우안성)', '화학(이규희)', '정보강(정의석)', '미적1(박희선)', '물리(이창학)', '창체', '창체'],
-    ['물리(이창학)', '교양3(이윤정)', '물리학실험( )', '문학A(이현익)', '영어A(정의석)', '문학B(최홍준)'],
-    ['진로2(오승협)', '체육(문지혜)', '물리학실험( )', '영어A(정의석)', '문학A(이현익)', '미적1(박희선)', '기하(우안성)'],
-]
-TIMES = [
-    ('08:20', '09:10'), ('09:20', '10:10'), ('10:20', '11:10'),
-    ('11:20', '12:10'), ('13:10', '14:00'), ('14:10', '15:00'),
-    ('15:10', '16:00'),
-]
-OVERRIDES = {'2026-11-12': {4: '영어A(정의석)', 5: '문학A(이현익)'}}
-NO_CLASS = {'2026-11-19'}
 RAW_HEADERS = ['날짜', '요일', '교시', '6반 과목', '6반 교사', '이전 과목', '이전 교사', '변경 표시', '검증 상태']
 
 
@@ -50,7 +37,7 @@ def verify_week_start(now, week_num, start_date):
     if actual != expected:
         raise RuntimeError(f'Upstream week mismatch: expected {expected}, got {actual}')
     return ('CURRENT_WEEK_DATE_VERIFIED' if week_num == 0
-            else 'NEXT_WEEK_DATE_VERIFIED_PERSONAL_UNMAPPED')
+            else 'NEXT_WEEK_DATE_VERIFIED')
 
 
 def fetch_live(week_num):
@@ -74,8 +61,8 @@ def fetch_live(week_num):
         for day in lessons[1:6]
         for lesson in day[:7]
     )
-    if lesson_count < 20:
-        raise RuntimeError(f'Unexpectedly sparse live timetable ({lesson_count} lessons)')
+    if lesson_count > 35:
+        raise RuntimeError('Invalid class lesson count')
 
     return {
         'school': table.school_name,
@@ -85,26 +72,6 @@ def fetch_live(week_num):
         'start_date': str(getattr(table, 'start_date', '')),
         'update_date': str(getattr(table, 'update_date', '')),
     }
-
-
-def regular_rows(now):
-    """Personal *baseline* for both weeks, never inferred from homeroom electives."""
-    rows = []
-    for week_num in (0, 1):
-        monday = week_monday(now, week_num)
-        for i in range(5):
-            date_str = (monday + timedelta(days=i)).isoformat()
-            if date_str in NO_CLASS or '2026-12-03' <= date_str <= '2026-12-09':
-                continue
-            base_day = 3 if date_str == '2026-11-16' else i
-            for period, title in enumerate(REGULAR[base_day], 1):
-                title = OVERRIDES.get(date_str, {}).get(period, title)
-                rows.append([
-                    date_str, '월화수목금'[i], period,
-                    TIMES[period - 1][0], TIMES[period - 1][1], title,
-                    'PERSONAL_BASELINE_NOT_LIVE_VERIFIED',
-                ])
-    return rows
 
 
 def live_rows(now, week_num, data, verification):
@@ -128,6 +95,11 @@ def live_rows(now, week_num, data, verification):
             ])
     if len(out) < 28:
         raise RuntimeError('Insufficient raw timetable rows')
+    if len(out) != 35:
+        raise RuntimeError('Expected 35 explicit weekday/period cells')
+    for row in out:
+        if bool(row[3]) != bool(row[4]):
+            raise RuntimeError('Incomplete subject/teacher pair')
     return out
 
 
@@ -160,70 +132,89 @@ def request_checked(session, method, url, **kwargs):
     return response.json() if response.content else {}
 
 
-def write_tabs(now, rows, reports):
+def normalized(rows, width):
+    return [[str(v) if v is not None else '' for v in (r + [''] * width)[:width]] for r in rows]
+
+
+def digest(rows):
+    return hashlib.sha256(json.dumps(normalized(rows, 9), ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+
+
+def write_tabs(now, reports):
     session = sheets_session()
     root = f'https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}'
-    metadata = request_checked(session, 'GET', root, params={'fields': 'sheets.properties(title)'})
-    existing = {s['properties']['title'] for s in metadata.get('sheets', [])}
-    names = ['개인기준시간표', '컴시간조회상태', '컴시간원본', '컴시간다음주']
-    missing = [name for name in names if name not in existing]
+    metadata = request_checked(session, 'GET', root, params={'fields': 'sheets.properties(sheetId,title)'})
+    sheets = {x['properties']['title']: x['properties']['sheetId'] for x in metadata['sheets']}
+    names = ['컴시간조회상태', '컴시간원본', '컴시간다음주']
+    missing = [name for name in names if name not in sheets]
     if missing:
-        request_checked(session, 'POST', root + ':batchUpdate', json={
-            'requests': [{'addSheet': {'properties': {'title': name}}} for name in missing]
-        })
-
+        raise RuntimeError('Required original tabs missing; preserve existing data: ' + ', '.join(missing))
     ok = sum(reports[w]['rows'] is not None for w in (0, 1))
-    same = reports[1]['verification'] == 'SAME_AS_THIS_WEEK_UNVERIFIED'
-    if ok == 2:
-        overall = 'ENC5_DECODED_BOTH_IDENTICAL_UNVERIFIED' if same else 'ENC5_DECODED_BOTH_UNMAPPED'
-    elif ok == 1:
-        overall = 'PARTIAL_FETCH_FAILED'
-    else:
-        overall = 'FETCH_FAILED_BOTH'
+    overall = 'COLLECTION_BOTH_DATE_VERIFIED' if ok == 2 else 'PARTIAL_FETCH_FAILED' if ok else 'FETCH_FAILED_BOTH'
+    status = [['항목', '값'], ['조회 시각(KST)', now.isoformat(timespec='seconds')], ['결과', overall],
+              ['학교코드', str(SCHOOL_ID)], ['학년', '2'], ['반', '6'],
+              ['이번 주 범위', str(week_monday(now, 0))], ['다음 주 범위', str(week_monday(now, 1))],
+              ['이번 주 요청 상태', reports[0]['status']], ['다음 주 요청 상태', reports[1]['status']],
+              ['다음 주 데이터 검증', reports[1]['verification']],
+              ['컴시간 원본 수업 수', str(reports[0]['count']) if reports[0]['rows'] is not None else '이전 데이터 유지'],
+              ['다음 주 원본 수업 수', str(reports[1]['count']) if reports[1]['rows'] is not None else '이전 데이터 유지'],
+              ['이번 주 컴시간 시작일(원문)', reports[0]['start_date']], ['다음 주 컴시간 시작일(원문)', reports[1]['start_date']],
+              ['이번 주 컴시간 갱신일(원문)', reports[0]['update_date']], ['다음 주 컴시간 갱신일(원문)', reports[1]['update_date']],
+              ['수집기 역할', '학교 원본 수집 및 저장 재조회'], ['실패 시 원본 처리', '실패한 주 기존 스냅샷 유지'],
+              ['이번 주 원본 SHA256', digest([RAW_HEADERS, *reports[0]['rows']]) if reports[0]['rows'] is not None else ''],
+              ['다음 주 원본 SHA256', digest([RAW_HEADERS, *reports[1]['rows']]) if reports[1]['rows'] is not None else '']]
+    writes = [('컴시간조회상태', status, 2)]
+    for w, title in ((0, '컴시간원본'), (1, '컴시간다음주')):
+        if reports[w]['rows'] is not None:
+            writes.append((title, [RAW_HEADERS, *reports[w]['rows']], 9))
+    previous = {}
+    for title, rows, width in writes:
+        previous[title] = request_checked(session, 'GET', root + '/values/' + title + '!A1:' + ('B40' if width == 2 else 'I100')).get('values', [])
+    def update(entries):
+        requests = []
+        for title, rows, width in entries:
+            requests.append({'updateCells': {'range': {'sheetId': sheets[title], 'startRowIndex': 0, 'endRowIndex': 40 if width == 2 else 100, 'startColumnIndex': 0, 'endColumnIndex': width},
+                'rows': [{'values': [{'userEnteredValue': {'stringValue': v}} for v in r]} for r in normalized(rows, width)], 'fields': 'userEnteredValue'}})
+        request_checked(session, 'POST', root + ':batchUpdate', json={'requests': requests})
+    def read_all():
+        return {title: request_checked(session, 'GET', root + '/values/' + title + '!A1:' + ('B40' if width == 2 else 'I100')).get('values', [])
+                for title, _, width in writes}
 
-    status_rows = [
-        ['항목', '값'],
-        ['조회 시각(KST)', now.isoformat(timespec='seconds')],
-        ['결과', overall],
-        ['학교코드', str(SCHOOL_ID)],
-        ['이번 주 범위', f"{week_monday(now, 0)} ~ {week_monday(now, 0) + timedelta(days=4)}"],
-        ['다음 주 범위', f"{week_monday(now, 1)} ~ {week_monday(now, 1) + timedelta(days=4)}"],
-        ['이번 주 요청 상태', reports[0]['status']],
-        ['다음 주 요청 상태', reports[1]['status']],
-        ['다음 주 데이터 검증', reports[1]['verification']],
-        ['컴시간 원본 수업 수', str(reports[0]['count']) if reports[0]['rows'] is not None else '이전 데이터 유지'],
-        ['다음 주 원본 수업 수', str(reports[1]['count']) if reports[1]['rows'] is not None else '이전 데이터 유지'],
-        ['이번 주 컴시간 시작일(원문)', reports[0]['start_date']],
-        ['다음 주 컴시간 시작일(원문)', reports[1]['start_date']],
-        ['이번 주 컴시간 갱신일(원문)', reports[0]['update_date']],
-        ['다음 주 컴시간 갱신일(원문)', reports[1]['update_date']],
-        ['컴시간 변경사항 자동적용', '아니오 (이동수업 매핑 미검증)'],
-        ['캘린더 변경', '없음'],
-        ['실패 시 원본 처리', '각 주의 기존 성공 스냅샷 유지'],
-    ]
-    if same:
-        status_rows.append(['주의', '두 요청의 수업 데이터가 동일함; 다음 주 확정 자료로 단정 금지'])
+    def matches(actual, expected):
+        return all(normalized(actual[title], width) == normalized(expected[title], width)
+                   for title, _, width in writes)
 
-    # Update statuses for both weeks, but overwrite a raw tab ONLY after that
-    # week's independent request succeeded. The other snapshot stays intact.
-    payload = [
-        {'range': "'개인기준시간표'!A1:G100", 'values': [
-            ['날짜', '요일', '교시', '시작', '종료', '개인 과목', '검증 상태'], *rows]},
-        {'range': "'컴시간조회상태'!A1:B30", 'values': status_rows},
-    ]
-    for week_num, title in ((0, '컴시간원본'), (1, '컴시간다음주')):
-        raw = reports[week_num]['rows']
-        if raw is not None:
-            payload.append({'range': f"'{title}'!A1:I100", 'values': [RAW_HEADERS, *raw]})
-
-    for title in ('개인기준시간표', '컴시간조회상태'):
-        request_checked(session, 'POST', root + f"/values/'{title}'!A1:Z500:clear", json={})
-    for week_num, title in ((0, '컴시간원본'), (1, '컴시간다음주')):
-        if reports[week_num]['rows'] is not None:
-            request_checked(session, 'POST', root + f"/values/'{title}'!A1:Z500:clear", json={})
-    request_checked(session, 'POST', root + '/values:batchUpdate', json={
-        'valueInputOption': 'RAW', 'data': payload,
-    })
+    # One atomic Sheets request. A lost response is resolved by reads, never a
+    # blind write retry. If reads also fail, report unknown completion.
+    expected = {title: rows for title, rows, _ in writes}
+    write_error = None
+    try:
+        update(writes)
+    except Exception as exc:
+        write_error = exc
+    actual = read_all()
+    if not matches(actual, expected):
+        if write_error is not None and matches(actual, previous):
+            raise write_error
+        mismatch = next(title for title, _, width in writes
+                        if normalized(actual[title], width) != normalized(expected[title], width))
+        # Only an observed mismatch permits restoring the captured original.
+        # A lost rollback response also requires readback, without retrying it.
+        rollback_error = None
+        try:
+            update([(title, previous[title], width) for title, _, width in writes])
+        except Exception as exc:
+            rollback_error = exc
+        restored = read_all()
+        for title, rows, width in writes:
+            if normalized(restored[title], width) != normalized(previous[title], width):
+                raise RuntimeError('Rollback verification failed: ' + title) from rollback_error
+        print('COLLECTOR_ROLLBACK_VERIFIED', file=sys.stderr)
+        raise RuntimeError('Sheet readback mismatch: ' + mismatch + '; original restored and verified') from write_error
+    evidence = {'schema': 2, 'schoolCode': SCHOOL_ID, 'grade': 2, 'classNumber': 6, 'observedAt': now.isoformat(), 'sheetReadback': True,
+                'weeks': [{'week': w, 'startDate': reports[w]['start_date'], 'rowCount': len(reports[w]['rows']) if reports[w]['rows'] is not None else 0,
+                           'sha256': digest([RAW_HEADERS, *reports[w]['rows']]) if reports[w]['rows'] is not None else None} for w in (0, 1)]}
+    print('COLLECTOR_EVIDENCE ' + json.dumps(evidence, ensure_ascii=False, separators=(',', ':')))
     return overall
 
 
@@ -253,22 +244,8 @@ def main():
             print(f'{label} failed; existing raw snapshot will be preserved: {exc!r}', file=sys.stderr)
         reports[week_num] = report
 
-    if reports[0]['rows'] is not None and reports[1]['rows'] is not None:
-        current, upcoming = reports[0]['rows'], reports[1]['rows']
-        if snapshot_signature(current) == snapshot_signature(upcoming):
-            reports[1]['verification'] = 'SAME_AS_THIS_WEEK_UNVERIFIED'
-            for row in upcoming:
-                row[8] = reports[1]['verification']
-            print('WARNING: Comcigan returned identical lesson grids for both week_num=0/1. '
-                  'Do not treat next-week dates as independently confirmed.')
-        else:
-            changes = sum(a != b for a, b in zip(snapshot_signature(current), snapshot_signature(upcoming)))
-            print(f'Week-to-week differing timetable cells: {changes}')
-
-    baseline = regular_rows(now)
-    overall = write_tabs(now, baseline, reports)
-    print(f'Sheets updated: {overall}; personal baseline rows={len(baseline)}; '
-          f'calendar writes=0')
+    overall = write_tabs(now, reports)
+    print(f'Collection and sheet readback: {overall}')
     if any(reports[w]['rows'] is None for w in (0, 1)):
         raise RuntimeError('At least one Comcigan week failed; see 컴시간조회상태; successful snapshots were preserved')
 
