@@ -40,6 +40,19 @@ def week_monday(now, week_num=0):
     return now.date() - timedelta(days=now.weekday()) + timedelta(weeks=week_num)
 
 
+def verify_week_start(now, week_num, start_date):
+    """Reject a mislabeled upstream week before replacing any snapshot."""
+    expected = week_monday(now, week_num)
+    try:
+        actual = datetime.strptime(str(start_date).strip(), '%Y-%m-%d').date()
+    except ValueError as exc:
+        raise RuntimeError('Invalid upstream week start date') from exc
+    if actual != expected:
+        raise RuntimeError(f'Upstream week mismatch: expected {expected}, got {actual}')
+    return ('CURRENT_WEEK_DATE_VERIFIED' if week_num == 0
+            else 'NEXT_WEEK_DATE_VERIFIED_PERSONAL_UNMAPPED')
+
+
 def fetch_live(week_num):
     """Use upstream's rotating token/key extraction; request each week separately."""
     from pycomcigan import TimeTable
@@ -230,8 +243,7 @@ def main():
             report['count'] = result['lesson_count']
             report['start_date'] = result['start_date']
             report['update_date'] = result['update_date']
-            report['verification'] = ('CURRENT_WEEK_REQUESTED' if week_num == 0
-                                      else 'NEXT_WEEK_REQUESTED_NOT_DATE_VERIFIED')
+            report['verification'] = verify_week_start(now, week_num, result['start_date'])
             report['rows'] = live_rows(now, week_num, result, report['verification'])
             report['status'] = 'ENC5_DECODED'
             print(f'{label}: enc5 decoded; {report["count"]} classes; raw rows={len(report["rows"])}')
