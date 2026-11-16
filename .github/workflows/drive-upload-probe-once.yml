@@ -37,7 +37,7 @@ jobs:
               sys.exit(1)
           try:
               cred=service_account.Credentials.from_service_account_info(
-                  json.loads(auth),scopes=['https://www.googleapis.com/auth/drive.file'])
+                  json.loads(auth),scopes=['https://www.googleapis.com/auth/drive'])
               client=AuthorizedSession(cred)
               chk=client.get('https://www.googleapis.com/drive/v3/files/'+folder,
                   params={'fields':'id,mimeType'},timeout=25)
