@@ -31,7 +31,7 @@ jobs:
       EALIMI_ID: ${{ secrets.EALIMI_ID }}
       EALIMI_PASSWORD: ${{ secrets.EALIMI_PASSWORD }}
       EALIMI_LIST_URL: ${{ secrets.EALIMI_LIST_URL }}
-      RUN_MODE: ${{ github.event_name == 'schedule' && 'all' || inputs.run_mode }}
+      RUN_MODE: ${{ github.event_name == 'schedule' && 'school' || inputs.run_mode }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
