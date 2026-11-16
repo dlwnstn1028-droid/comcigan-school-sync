@@ -422,7 +422,18 @@ def collect_ealimi():
             if not results:
                 print('EALIMI_LINK_DIAG', json.dumps(diagnostics))
                 raise RuntimeError('EALIMI_LAYOUT_UNVERIFIED (no confirmed notice detail links)')
-            return results
+            enrichment = None
+            if os.getenv('NOTICE_ENRICH_ENABLED', 'true').lower() in ('true', '1', 'yes'):
+                try:
+                    from notice_enrich import enrich_authenticated
+                    enrich_session, enrich_sid = sheet_session()
+                    enrichment = enrich_authenticated(page, results, enrich_session, enrich_sid)
+                    # Emit only aggregate counts, not private titles, URLs or texts.
+                    print('EALIMI_ENRICH_COUNTS', json.dumps(enrichment, ensure_ascii=False))
+                except Exception as exc:
+                    enrichment = {'error': type(exc).__name__}
+                    print('EALIMI_ENRICH_STATUS', 'FAILED', type(exc).__name__)
+            return results, enrichment
         finally:
             context.close()
             browser.close()
@@ -534,6 +545,7 @@ def main():
     session, sid = sheet_session()
     ensure_tabs(session, sid)
     combined = {}
+    public = {}
     results = []
     failures = []
     if mode in ('school', 'all'):
@@ -546,9 +558,18 @@ def main():
             results.extend([(s, 'FAILED', 0, type(e).__name__) for s in BOARDS])
     if mode in ('ealimi', 'all'):
         try:
-            arr = collect_ealimi()
+            arr, enrich = collect_ealimi()
             combined['e알리미'] = arr
-            results.append(('e알리미', 'OK_LIST_ONLY', len(arr), 'Login and summary rows; detail/attachments unverified'))
+            results.append(('e알리미', 'OK_LIST_ONLY', len(arr), 'Verified notice links; contents in separate tabs'))
+            if isinstance(enrich, dict):
+                if 'error' in enrich:
+                    results.append(('e알리미_원문', 'FAILED', 0, enrich['error']))
+                    failures.append('EALIMI_ENRICH_FAILED')
+                else:
+                    pending = max(0, enrich.get('queued', 0) - enrich.get('processed', 0))
+                    state = 'PARTIAL' if enrich.get('failed', 0) or pending else 'OK'
+                    results.append(('e알리미_원문', state, enrich.get('processed', 0),
+                                    f"pending={pending}; failed={enrich.get('failed', 0)}"))
         except Exception as e:
             failures.append('EALIMI_FAILED')
             reason = str(e)
@@ -558,6 +579,18 @@ def main():
     if combined:
         counts = upsert_notices(session, sid, combined)
         print('SHEET_SAVED; counts=', json.dumps(counts, ensure_ascii=False))
+    if public and os.getenv('NOTICE_ENRICH_ENABLED', 'true').lower() in ('true', '1', 'yes'):
+        try:
+            from notice_enrich import enrich_public
+            public_stats = enrich_public(public, session, sid)
+            print('PUBLIC_ENRICH_COUNTS', json.dumps(public_stats, ensure_ascii=False))
+            pending = max(0, public_stats['queued'] - public_stats['processed'])
+            state = 'PARTIAL' if public_stats['failed'] or pending else 'OK'
+            results.append(('휘문고_원문', state, public_stats['processed'],
+                            f"pending={pending}; failed={public_stats['failed']}"))
+        except Exception as exc:
+            results.append(('휘문고_원문', 'FAILED', 0, type(exc).__name__))
+            failures.append('PUBLIC_ENRICH_FAILED')
     update_status(session, sid, results)
     for src,status,count,reason in results:
         print('SOURCE',src,status,count,reason)  # no private title, URL, identifier or credentials
