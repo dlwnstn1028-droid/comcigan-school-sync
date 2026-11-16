@@ -1,0 +1,53 @@
+name: One-time owner-account PDF backup live test
+on:
+  push:
+    paths: ['.github/workflows/owner-backup-live-once.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: contains(github.event.head_commit.message, 'OWNER_BACKUP_LIVE_ONCE_20261116')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NOTICE_UPLOAD_WEBAPP_URL: ${{ secrets.NOTICE_UPLOAD_WEBAPP_URL }}
+      NOTICE_UPLOAD_TOKEN: ${{ secrets.NOTICE_UPLOAD_TOKEN }}
+      NOTICE_DRIVE_FOLDER_ID: ${{ secrets.NOTICE_DRIVE_FOLDER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal dependencies
+        run: pip install -q -r requirements-notices.txt
+      - name: Write synthetic PDF and verify backup response without exposing secrets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os,sys
+          from notice_enrich import archive_to_drive
+          def pdf():
+              objects=[
+                b'<< /Type /Catalog /Pages 2 0 R >>',
+                b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+                b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << >> >>',
+                b'<< /Length 0 >>\nstream\n\nendstream'
+              ]
+              data=b'%PDF-1.4\n'
+              offsets=[0]
+              for i,obj in enumerate(objects,1):
+                  offsets.append(len(data))
+                  data+=(str(i)+' 0 obj\n').encode()+obj+b'\nendobj\n'
+              startxref=len(data)
+              data+=('xref\n0 5\n0000000000 65535 f \n').encode()
+              for off in offsets[1:]:
+                  data+=('%010d 00000 n \n'%off).encode()
+              data+=('trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n'%startxref).encode()
+              return data
+          if not os.getenv('NOTICE_UPLOAD_WEBAPP_URL') or not os.getenv('NOTICE_UPLOAD_TOKEN'):
+              print('OWNER_BACKUP_LIVE: SECRETS_MISSING')
+              sys.exit(1)
+          url,status=archive_to_drive(pdf(),'_temporary_owner_backup_test_20261116','probe_owner_backup')
+          print('OWNER_BACKUP_LIVE: '+status)
+          sys.exit(0 if status=='DRIVE_SAVED' and url.startswith('https://drive.google.com/') else 2)
+          PY
