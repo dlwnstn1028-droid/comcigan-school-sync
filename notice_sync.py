@@ -124,9 +124,44 @@ def collect_ealimi():
                 button.click(timeout=15000)
             else:
                 page.get_by_text('로그인', exact=True).last.click(timeout=15000)
-            page.wait_for_timeout(2800)
-            if '/Member/SignIn' in page.url:
-                # This covers incorrect login / 2FA / CAPTCHA / login layout changes.
+            # eAlimi authenticates using asynchronous JavaScript; do not mistake
+            # a slow post-click transition for an authentication failure.
+            # ONE login attempt only, to avoid account lockouts.
+            try:
+                page.wait_for_url(
+                    lambda url: '/member/signin' not in urlparse(str(url)).path.lower(),
+                    timeout=12000,
+                )
+            except Exception as wait_error:
+                # A timeout by itself is not proof that the credentials are wrong.
+                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+                if not isinstance(wait_error, PlaywrightTimeoutError):
+                    raise
+            if '/member/signin' in urlparse(page.url).path.lower():
+                # Only print boolean categories, never error messages, HTML,
+                # member identifiers, URLs, cookies, passwords, or screenshots.
+                body_text = page.locator('body').inner_text(timeout=5000)
+                credential_rejected = ('아이디 또는 비밀번호가 일치하지' in body_text)
+                locked_out = any(term in body_text for term in (
+                    '30분간 로그인이 제한', '로그인이 차단된 상태', '비밀번호를 5회',
+                ))
+                verification_prompt = any(term in body_text for term in (
+                    '추가 인증', '인증번호 입력', '휴대폰 본인인증',
+                ))
+                print('EALIMI_AUTH_DIAG', json.dumps({
+                    'stayed_on_signin': True,
+                    'credential_rejected': credential_rejected,
+                    'lockout_detected': locked_out,
+                    'verification_prompt': verification_prompt,
+                    'login_button_visible': bool(page.locator('#signInSubmitBtn:visible').count()),
+                    'visible_dialogs': page.locator('[role="dialog"]:visible, .modal:visible, .devlayer:visible').count(),
+                }, ensure_ascii=False))
+                if locked_out:
+                    raise RuntimeError('EALIMI_AUTH_LOCKOUT_STOP_RETRYING')
+                if credential_rejected:
+                    raise RuntimeError('EALIMI_AUTH_CREDENTIALS_REJECTED_CHECK_SECRETS')
+                if verification_prompt:
+                    raise RuntimeError('EALIMI_AUTH_EXTRA_VERIFICATION_REQUIRED')
                 raise RuntimeError('EALIMI_AUTH_UNVERIFIED_OR_EXTRA_STEP')
             target = os.getenv('EALIMI_LIST_URL', '').strip()
             navigation_clicked = False
