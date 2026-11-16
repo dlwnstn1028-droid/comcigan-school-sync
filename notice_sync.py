@@ -354,6 +354,20 @@ def collect_ealimi():
                 cls = ' '.join(el.get('class', [])) + ' ' + ' '.join(el.parent.get('class', []) if el.parent else [])
                 if not m and not re.search(r'alimi|receive|notice|list', cls, re.I):
                     continue
+                
+                if title == 'URL(주소) 복사':
+
+                    continue
+
+                if (
+
+                    urlparse(href).path.lower().rstrip('/')
+
+                    == urlparse(page.url).path.lower().rstrip('/')
+
+                ):
+
+                    continue
                 uid = fingerprint(href, title, date)
                 results.append({'source': 'e알리미', 'notice_id': uid,
                                 'title': title, 'published_at': date, 'url': href,
