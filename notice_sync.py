@@ -96,6 +96,19 @@ def is_ealimi_url(url):
     return u.scheme == 'https' and (u.hostname == 'www.ealimi.com' or u.hostname == 'ealimi.com')
 
 
+def permit_session_replacement(result_code, dialog_type, already_accepted, http_status):
+    """One approved session replacement, only for eAlimi's explicit code 93.
+
+    Do not accept a generic confirmation dialog or repeat a forced login.
+    Result code 93 is PASS_OTHERS_USE in the site's public login script.
+    """
+    return (
+        str(result_code) == '93'
+        and dialog_type == 'confirm'
+        and not already_accepted
+        and http_status == 200
+    )
+
 def collect_ealimi():
     """Read only the list rendered for an authorised user, without opening items.
 
@@ -117,6 +130,86 @@ def collect_ealimi():
             passwd = page.locator('input[type="password"]:visible').first
             if username.count() == 0 or passwd.count() == 0:
                 raise RuntimeError('EALIMI_LOGIN_LAYOUT_CHANGED')
+            # eAlimi reports failed sign-ins with native JavaScript alert()/confirm().
+            # Playwright otherwise auto-dismisses these dialogs: HTML/body text
+            # checks alone cannot distinguish incorrect secrets from network errors.
+            # Do not print dialog text or capture any credential-bearing network data.
+            auth_diag = {
+                'auth_post_seen': False,
+                'auth_post_status': None,
+                'js_alert_seen': False,
+                'js_confirm_seen': False,
+                'credentials_rejected': False,
+                'lockout_detected': False,
+                'verification_prompt': False,
+                'concurrent_session_prompt': False,
+                'server_error_alert': False,
+                'other_alert': False,
+                'page_js_error_seen': False,
+                'session_conflict_result': False,
+                'force_login_accepted': False,
+                'auth_post_count': 0,
+                'response_result_code': None,
+            }
+
+            def handle_login_dialog(dialog):
+                # The login page's public signIn.js creates a native confirm()
+                # exclusively for ResultCode.PASS_OTHERS_USE (numeric result 93).
+                # Proceed only when the server JSON CONFIRMS code 93. This may
+                # end a different device's eAlimi session (user-approved).
+                message = dialog.message or ''
+                if dialog.type == 'confirm':
+                    auth_diag['js_confirm_seen'] = True
+                    if permit_session_replacement(
+                        auth_diag['response_result_code'],
+                        dialog.type,
+                        auth_diag['force_login_accepted'],
+                        auth_diag['auth_post_status'],
+                    ):
+                        auth_diag['force_login_accepted'] = True
+                        auth_diag['session_conflict_result'] = True
+                        dialog.accept()
+                        return
+                    # Unknown confirmations must not be accepted.
+                    dialog.dismiss()
+                    return
+                if dialog.type == 'alert':
+                    auth_diag['js_alert_seen'] = True
+                    if any(token in message for token in ('비밀번호가 일치하지', '아이디 또는 비밀번호가 일치하지', '아이디 또는 비밀번호를 확인')):
+                        auth_diag['credentials_rejected'] = True
+                    elif any(token in message for token in ('30분간 로그인이 제한', '로그인이 차단된 상태', '5회 틀려', '인증에 실패하여 로그인이 차단')):
+                        auth_diag['lockout_detected'] = True
+                    elif any(token in message for token in ('추가 인증', '인증번호', '본인인증', '기기 인증')):
+                        auth_diag['verification_prompt'] = True
+                    elif 'Code:' in message or '관리자에게 문의' in message:
+                        auth_diag['server_error_alert'] = True
+                    else:
+                        auth_diag['other_alert'] = True
+                # Never log/emit dialog messages, account IDs or any tokens.
+                dialog.dismiss()
+
+            def handle_auth_response(response):
+                try:
+                    req = response.request
+                    if req.method != 'POST' or urlparse(response.url).path.lower().rstrip('/') != '/member/signin':
+                        return
+                    auth_diag['auth_post_seen'] = True
+                    auth_diag['auth_post_count'] += 1
+                    auth_diag['auth_post_status'] = response.status
+                    auth_diag['response_result_code'] = None
+                    if response.status == 200:
+                        # Read the authenticated AJAX result IN MEMORY only;
+                        # never print/store the response body or its message.
+                        data = response.json()
+                        if isinstance(data, dict) and str(data.get('result')) == '93':
+                            auth_diag['response_result_code'] = 93
+                except Exception:
+                    # If JSON/response inspection is unavailable, fail closed.
+                    auth_diag['response_result_code'] = None
+
+            page.on('dialog', handle_login_dialog)
+            page.on('response', handle_auth_response)
+            page.on('pageerror', lambda _error: auth_diag.__setitem__('page_js_error_seen', True))
             username.fill(user)
             passwd.fill(password)
             button = page.get_by_role('button', name=re.compile('로그인')).first
@@ -141,20 +234,32 @@ def collect_ealimi():
                 # Only print boolean categories, never error messages, HTML,
                 # member identifiers, URLs, cookies, passwords, or screenshots.
                 body_text = page.locator('body').inner_text(timeout=5000)
-                credential_rejected = ('아이디 또는 비밀번호가 일치하지' in body_text)
-                locked_out = any(term in body_text for term in (
+                credential_rejected = auth_diag['credentials_rejected'] or ('아이디 또는 비밀번호가 일치하지' in body_text)
+                locked_out = auth_diag['lockout_detected'] or any(term in body_text for term in (
                     '30분간 로그인이 제한', '로그인이 차단된 상태', '비밀번호를 5회',
                 ))
-                verification_prompt = any(term in body_text for term in (
+                verification_prompt = auth_diag['verification_prompt'] or any(term in body_text for term in (
                     '추가 인증', '인증번호 입력', '휴대폰 본인인증',
                 ))
+                # Print only whitelisted flags and HTTP status codes.
+                # No dialog text, user IDs, passwords, HTML, cookies, headers,
+                # request payloads, URLs, screenshots, or account content.
                 print('EALIMI_AUTH_DIAG', json.dumps({
                     'stayed_on_signin': True,
-                    'credential_rejected': credential_rejected,
-                    'lockout_detected': locked_out,
-                    'verification_prompt': verification_prompt,
-                    'login_button_visible': bool(page.locator('#signInSubmitBtn:visible').count()),
-                    'visible_dialogs': page.locator('[role="dialog"]:visible, .modal:visible, .devlayer:visible').count(),
+                    'credential_rejected': bool(credential_rejected),
+                    'lockout_detected': bool(locked_out),
+                    'verification_prompt': bool(verification_prompt),
+                    'auth_post_seen': auth_diag['auth_post_seen'],
+                    'auth_post_http_status': auth_diag['auth_post_status'],
+                    'js_alert_seen': auth_diag['js_alert_seen'],
+                    'js_confirm_seen': auth_diag['js_confirm_seen'],
+                    'concurrent_session_prompt': auth_diag['concurrent_session_prompt'],
+                    'server_error_alert': auth_diag['server_error_alert'],
+                    'other_alert': auth_diag['other_alert'],
+                    'page_js_error_seen': auth_diag['page_js_error_seen'],
+                    'session_conflict_code_93': auth_diag['session_conflict_result'],
+                    'force_login_accepted': auth_diag['force_login_accepted'],
+                    'auth_post_count': auth_diag['auth_post_count'],
                 }, ensure_ascii=False))
                 if locked_out:
                     raise RuntimeError('EALIMI_AUTH_LOCKOUT_STOP_RETRYING')
@@ -162,6 +267,16 @@ def collect_ealimi():
                     raise RuntimeError('EALIMI_AUTH_CREDENTIALS_REJECTED_CHECK_SECRETS')
                 if verification_prompt:
                     raise RuntimeError('EALIMI_AUTH_EXTRA_VERIFICATION_REQUIRED')
+                if auth_diag['force_login_accepted']:
+                    raise RuntimeError('EALIMI_FORCE_LOGIN_ACCEPTED_BUT_NOT_REDIRECTED')
+                if auth_diag['js_confirm_seen']:
+                    raise RuntimeError('EALIMI_AUTH_CONFIRMATION_NOT_VERIFIED_AS_SESSION_CONFLICT')
+                if auth_diag['server_error_alert']:
+                    raise RuntimeError('EALIMI_AUTH_SERVER_ERROR_ALERT')
+                if auth_diag['other_alert']:
+                    raise RuntimeError('EALIMI_AUTH_ALERT_UNCLASSIFIED')
+                if not auth_diag['auth_post_seen']:
+                    raise RuntimeError('EALIMI_AUTH_REQUEST_NOT_SENT')
                 raise RuntimeError('EALIMI_AUTH_UNVERIFIED_OR_EXTRA_STEP')
             target = os.getenv('EALIMI_LIST_URL', '').strip()
             navigation_clicked = False
@@ -329,7 +444,19 @@ def upsert_notices(session, sid, by_source):
 
 
 def update_status(session, sid, statuses):
-    rows = [STAT_HEADERS] + [[name, now_kst(), status, str(count), reason[:180]] for name, status, count, reason in statuses]
+    """Keep the latest health of ALL sources, even when running one mode.
+
+    The old implementation only overwrote the top rows and left misleading
+    stale status rows. Maintain one row per source in a stable order.
+    """
+    prior_rows = get_values(session, sid, SHEET_NAMES['status'], 'A2:E12')
+    by_source = {
+        row[0]: row[:5] for row in prior_rows
+        if len(row) >= 5 and row[0] in SOURCES
+    }
+    for name, status, count, reason in statuses:
+        by_source[name] = [name, now_kst(), status, str(count), reason[:180]]
+    rows = [STAT_HEADERS] + [by_source[name] for name in SOURCES if name in by_source]
     put_values(session, sid, SHEET_NAMES['status'], f'A1:E{len(rows)}', rows)
 
 
