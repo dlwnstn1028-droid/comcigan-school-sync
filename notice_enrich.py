@@ -285,6 +285,41 @@ def archive_to_drive(data,name,notice_id):
     If folder is not configured/accessible, return status; do not leak bytes to
     GitHub artifacts or unauthenticated storage. Credentials never logged.
     """
+    # When configured, a private Apps Script web app writes the PDF as the
+    # human Drive owner; service accounts cannot own files in personal My Drive.
+    owner_endpoint=os.getenv('NOTICE_UPLOAD_WEBAPP_URL','').strip()
+    owner_token=os.getenv('NOTICE_UPLOAD_TOKEN','').strip()
+    if owner_endpoint or owner_token:
+        if not owner_endpoint or len(owner_token)<50:
+            return '', 'OWNER_BACKUP_SECRET_MISSING'
+        p=urlparse(owner_endpoint)
+        if (p.scheme!='https' or p.hostname!='script.google.com'
+                or not re.fullmatch(r'/macros/s/[A-Za-z0-9_-]+/exec',p.path)
+                or p.query or p.fragment):
+            return '', 'OWNER_BACKUP_ENDPOINT_INVALID'
+        if len(data)>6*1024*1024:
+            return '', 'OWNER_BACKUP_PDF_TOO_LARGE'
+        try:
+            import base64
+            payload={'token':owner_token, 'filename':name, 'notice_id':str(notice_id),
+                     'sha256':digest(data),
+                     'content_b64':base64.b64encode(data).decode('ascii')}
+            resp=requests.post(owner_endpoint,json=payload,timeout=45)
+            if resp.status_code!=200:
+                return '', 'OWNER_BACKUP_HTTP_ERROR'
+            info=resp.json()
+            if info.get('ok') is True and info.get('status') in ('SAVED','ALREADY_SAVED'):
+                fid=str(info.get('id',''))
+                link=str(info.get('url',''))
+                if re.fullmatch(r'[A-Za-z0-9_-]{10,}',fid) and (
+                        link.startswith('https://drive.google.com/file/d/') or
+                        link.startswith('https://drive.google.com/open?')):
+                    return link, 'DRIVE_SAVED'
+            return '', 'OWNER_BACKUP_REJECTED'
+        except Exception:
+            # No exception data: never print private payloads or token.
+            return '', 'OWNER_BACKUP_FAILED'
+    # Legacy upload path remains unchanged until the owner web app is deployed.
     folder=os.getenv('NOTICE_DRIVE_FOLDER_ID','').strip()
     if not folder:return '', 'DRIVE_NOT_CONFIGURED'
     try:
