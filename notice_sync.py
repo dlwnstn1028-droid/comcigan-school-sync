@@ -1,3 +1,4 @@
+# EXTENDED_NOTICE_PIPELINE: checked by optional notice_enrich integration.
 """Whimoon public board + authorised eAlimi inbox LIST watcher.
 
 Never send passwords or private notice content to GitHub logs.
