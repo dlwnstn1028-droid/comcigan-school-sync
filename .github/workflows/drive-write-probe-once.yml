@@ -1,0 +1,68 @@
+name: One-time Drive backup write verification
+on:
+  push:
+    paths:
+      - '.github/workflows/drive-write-probe-once.yml'
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: contains(github.event.head_commit.message, 'DRIVE_PROBE_ONCE_20261116')
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      NOTICE_DRIVE_FOLDER_ID: ${{ secrets.NOTICE_DRIVE_FOLDER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install auth libraries
+        run: pip install -q google-auth requests
+      - name: Safe Google Drive write and cleanup check
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession
+          folder=os.getenv('NOTICE_DRIVE_FOLDER_ID','').strip()
+          raw=os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON','').strip()
+          if not folder:
+              print('DRIVE_PROBE: FOLDER_SECRET_MISSING')
+              sys.exit(1)
+          if not raw:
+              print('DRIVE_PROBE: AUTH_SECRET_MISSING')
+              sys.exit(1)
+          try:
+              credentials=service_account.Credentials.from_service_account_info(
+                  json.loads(raw),scopes=['https://www.googleapis.com/auth/drive.file'])
+              session=AuthorizedSession(credentials)
+              data={'name':'notice-write-check-temporary.txt','parents':[folder],
+                    'mimeType':'text/plain','description':'Temporary permission check; do not retain'}
+              response=session.post('https://www.googleapis.com/drive/v3/files',
+                  params={'fields':'id,parents'}, json=data, timeout=30)
+              if response.status_code not in (200,201):
+                  print('DRIVE_PROBE: WRITE_FAILED; HTTP_STATUS='+str(response.status_code))
+                  try:
+                      reason=response.json().get('error',{}).get('errors',[{}])[0].get('reason','unknown')
+                      print('DRIVE_PROBE: REASON='+str(reason)[:60])
+                  except Exception:
+                      pass
+                  sys.exit(2)
+              fid=response.json().get('id')
+              if not fid:
+                  print('DRIVE_PROBE: WRITE_UNVERIFIED')
+                  sys.exit(3)
+              print('DRIVE_PROBE: WRITE_OK')
+              dr=session.delete('https://www.googleapis.com/drive/v3/files/'+fid,timeout=30)
+              if dr.status_code==204:
+                  print('DRIVE_PROBE: CLEANUP_OK')
+              else:
+                  print('DRIVE_PROBE: CLEANUP_FAILED; HTTP_STATUS='+str(dr.status_code))
+                  sys.exit(4)
+          except Exception as ex:
+              print('DRIVE_PROBE: EXCEPTION='+type(ex).__name__)
+              sys.exit(5)
+          PY
