@@ -18,7 +18,7 @@ jobs:
       EALIMI_LIST_URL: ${{ secrets.EALIMI_LIST_URL }}
       RUN_MODE: ealimi
       NOTICE_ENRICH_ENABLED: 'true'
-      EALIMI_DETAIL_MAX_PER_RUN: '5'
+      EALIMI_DETAIL_MAX_PER_RUN: '8'
       NOTICE_DRIVE_FOLDER_ID: ''
     steps:
       - uses: actions/checkout@v4
