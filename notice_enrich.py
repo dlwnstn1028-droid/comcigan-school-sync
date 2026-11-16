@@ -420,6 +420,53 @@ def process_detail(page,record,session,sid,state,public=False):
         return 'FAILED',0,0,0
 
 
+
+def backfill_archive(context,session,sid,public=False):
+    """Save previously parsed PDFs that predate owner-account backup setup.
+
+    The attachment row is modified ONLY after the authenticated owner endpoint
+    returns a verified Drive file link. Never log titles, URLs or contents.
+    A bounded pass makes this safe to repeat on the usual collection schedule.
+    """
+    if not (os.getenv('NOTICE_UPLOAD_WEBAPP_URL','').strip() and
+            os.getenv('NOTICE_UPLOAD_TOKEN','').strip()):
+        return {'queued':0,'saved':0,'failed':0}
+    original=sheet_values(session,sid,ATTACH_TAB,'A2:K10000')
+    pending=[]
+    for rownum,r in enumerate(original,start=2):
+        if len(r)<9:continue
+        source=str(r[0])
+        if public:
+            if not source.startswith('휘문고_'):continue
+        elif source!='e알리미':
+            continue
+        if len(r)>10 and r[10]:continue
+        if str(r[5])!='application/pdf':continue
+        if not safe_url(str(r[4]),public=public):continue
+        pending.append((rownum,r))
+    budget=max(1,min(12,int(os.getenv('NOTICE_BACKFILL_MAX_PER_RUN','8'))))
+    stats={'queued':len(pending),'saved':0,'failed':0}
+    for rownum,original_row in pending[:budget]:
+        try:
+            data,fetch_state=fetch_pdf_in_session(context,str(original_row[4]),public=public)
+            if not data:
+                stats['failed']+=1
+                continue
+            url,status=archive_to_drive(data,str(original_row[3]),str(original_row[1]))
+            if status!='DRIVE_SAVED' or not url:
+                stats['failed']+=1
+                continue
+            row=list(original_row)+['']*max(0,11-len(original_row))
+            row=row[:11]
+            row[7]=str(row[7]).split(';')[0]+';DRIVE_SAVED'
+            row[9]=now_kst()
+            row[10]=url
+            sheet_update(session,sid,ATTACH_TAB,rownum,row)
+            stats['saved']+=1
+        except Exception:
+            stats['failed']+=1
+    return stats
+
 def enrich_authenticated(page,notices,session,sid):
     ensure_tabs(session,sid)
     state=initial_state(session,sid)
@@ -432,6 +479,7 @@ def enrich_authenticated(page,notices,session,sid):
         status,body,attachments,review=process_detail(page,record,session,sid,state)
         stats['processed']+=status=='SAVED';stats['failed']+=status=='FAILED'
         stats['text_segments']+=body;stats['attachments']+=attachments;stats['review_candidates']+=review
+    stats['backfill']=backfill_archive(page.context,session,sid,public=False)
     return stats
 
 
@@ -471,4 +519,5 @@ def enrich_public(notices_by_source,session,sid):
         st,body,atts,rev=process_detail(page,record,session,sid,state,public=True)
         stats['processed']+=st=='SAVED';stats['failed']+=st=='FAILED'
         stats['text_segments']+=body;stats['attachments']+=atts;stats['review_candidates']+=rev
+    stats['backfill']=backfill_archive(page.context,session,sid,public=True)
     return stats
