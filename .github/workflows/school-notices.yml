@@ -48,7 +48,11 @@ jobs:
 
       - run: pip install -r requirements-notices.txt
 
-      - run: python -m playwright install --with-deps chromium
+
+      - name: Install browser only when needed
+        if: env.RUN_MODE != 'school'
+        run: python -m playwright install --with-deps chromium
+
 
       - name: Verify parser
         run: python -m pytest tests/test_notices.py -q
