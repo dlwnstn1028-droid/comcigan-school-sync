@@ -213,9 +213,6 @@ def collect_ealimi():
             page.on('pageerror', lambda _error: auth_diag.__setitem__('page_js_error_seen', True))
             username.fill(user)
             passwd.fill(password)
-           
-            username.fill(user)
-            passwd.fill(password)
             auth_diag['login_click_started'] = True
 
             button = page.get_by_role('button', name=re.compile('로그인')).first
