@@ -304,12 +304,34 @@ def collect_ealimi():
                                 continue
                     if navigation_clicked:
                         break
-            # Allow the authenticated notice list time to render asynchronously.
-            page.wait_for_timeout(2500)
-            if '/Member/SignIn' in page.url:
+            
+            # Verify inbox using its URL, not its displayed title.
+            page.wait_for_timeout(3500)
+
+            actual_path = urlparse(page.url).path.lower().rstrip('/')
+
+            if actual_path.startswith('/member/signin'):
                 raise RuntimeError('EALIMI_AUTH_EXPIRED')
-            if '받은알리미' not in page.locator('body').inner_text().replace(' ', ''):
+
+            if target:
+                expected_path = urlparse(target).path.lower().rstrip('/')
+                inbox_reached = (
+                    actual_path == expected_path
+                    or actual_path.startswith(expected_path + '/')
+                )
+
+                print('EALIMI_ROUTE_DIAG', json.dumps({
+                    'inbox_route_reached': inbox_reached,
+                    'redirected_to_main': actual_path.startswith('/main'),
+                    'login_route': actual_path.startswith('/member/signin'),
+                }))
+
+                if not inbox_reached:
+                    raise RuntimeError('EALIMI_INBOX_ROUTE_MISMATCH')
+
+            elif '받은알리미' not in page.locator('body').inner_text().replace(' ', ''):
                 raise RuntimeError('EALIMI_INBOX_NAVIGATION_UNVERIFIED')
+
             soup = BeautifulSoup(page.content(), 'html.parser')
             # Only consider rows/cards in list structures (do not open notices).
             candidates = soup.select('table tbody tr, [class*="list"] li, [class*="List"] li, [class*="notice"] li, [class*="Notice"] li')
