@@ -129,17 +129,30 @@ def collect_ealimi():
                 # This covers incorrect login / 2FA / CAPTCHA / login layout changes.
                 raise RuntimeError('EALIMI_AUTH_UNVERIFIED_OR_EXTRA_STEP')
             target = os.getenv('EALIMI_LIST_URL', '').strip()
+            navigation_clicked = False
             if target:
                 if not is_ealimi_url(target):
                     raise RuntimeError('EALIMI_LIST_URL_NOT_ALLOWED')
                 page.goto(target, wait_until='domcontentloaded', timeout=30000)
+                navigation_clicked = True
             else:
+                # A hidden menu entry may appear before the visible one.
+                # Only click a visible navigation entry, never a notice detail.
                 for name in ['받은 알리미', '받은알리미', '알리미 모아보기']:
-                    item = page.get_by_text(name, exact=False).first
-                    if item.count() and item.is_visible():
-                        item.click(timeout=8000)
+                    matches = page.get_by_text(name, exact=False)
+                    for idx in range(min(matches.count(), 12)):
+                        item = matches.nth(idx)
+                        if item.is_visible():
+                            try:
+                                item.click(timeout=5000)
+                                navigation_clicked = True
+                                break
+                            except Exception:
+                                continue
+                    if navigation_clicked:
                         break
-            page.wait_for_timeout(1100)
+            # Allow the authenticated notice list time to render asynchronously.
+            page.wait_for_timeout(2500)
             if '/Member/SignIn' in page.url:
                 raise RuntimeError('EALIMI_AUTH_EXPIRED')
             if '받은알리미' not in page.locator('body').inner_text().replace(' ', ''):
@@ -174,7 +187,23 @@ def collect_ealimi():
             # Dedupe and guard against treating unrelated homepage menus as announcements.
             results = list({r['notice_id']: r for r in results}.values())
             if not results:
-                # Never log page HTML, text, screenshots or a member identifier.
+                # Diagnostics are aggregate element COUNTS only. Never log HTML,
+                # notice text/titles, URLs, screenshots, member IDs or secrets.
+                structure = {
+                    'navigation_attempted': navigation_clicked,
+                    'login_button_present': bool(page.locator('#signInSubmitBtn').count()),
+                    'table_count': len(soup.select('table')),
+                    'table_body_rows': len(soup.select('table tbody tr')),
+                    'list_items': len(soup.select('li')),
+                    'article_count': len(soup.select('article')),
+                    'iframe_count': len(soup.select('iframe')),
+                    'link_count': len(soup.select('a[href]')),
+                    'candidate_nodes': len(candidates),
+                    'card_class_nodes': len(soup.select('[class*="card"], [class*="Card"]')),
+                    'item_class_nodes': len(soup.select('[class*="item"], [class*="Item"]')),
+                    'role_rows': len(soup.select('[role="row"]')),
+                }
+                print('EALIMI_STRUCTURE_COUNTS', json.dumps(structure, ensure_ascii=False))
                 raise RuntimeError('EALIMI_LAYOUT_UNVERIFIED (login may work; inbox list not recognised)')
             return results
         finally:
