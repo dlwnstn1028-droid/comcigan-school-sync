@@ -109,6 +109,111 @@ def permit_session_replacement(result_code, dialog_type, already_accepted, http_
         and http_status == 200
     )
 
+
+# Observed public eAlimi links use /ReceivedNoti/Content/?l_id=...&addrid=...
+# and /ReceivedNoti/LetterReplyNew/<id>/... .
+# Never treat links to the inbox, menus, or generic copy/share buttons as notices.
+EALIMI_DETAIL_PATH = re.compile(
+    r'^/ReceivedNoti/(?:Content|ContentLastApp|LetterReplyNew)(?:/|$)', re.I
+)
+EALIMI_EMBEDDED_URL = re.compile(
+    r'(?:https?://(?:www\.)?ealimi\.com)?(/ReceivedNoti/(?:Content|ContentLastApp|LetterReplyNew)(?:/[^\\\s\"\'<>)]*)?)', re.I
+)
+EALIMI_DATE = re.compile(r'(20\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})')
+EALIMI_UTILITY_TEXT = {
+    'URL(주소) 복사', '주소 복사', '공유', '보기', '열기', '확인',
+    '홈', '받은알리미', '받은 알리미', '모든 계정 모아보기',
+    '돌아가기', '로그아웃', '설정', '목록',
+}
+
+
+def extract_verified_ealimi_notices(html, current_url):
+    '''Extract *only* nodes with an explicit eAlimi received-notice detail URL.
+
+    Read-only: no clicks on an unread notice and no detail request. Never log
+    private titles, URLs or account identifiers.'''
+    from bs4 import BeautifulSoup
+    from urllib.parse import parse_qs
+    soup = BeautifulSoup(html, 'html.parser')
+    results = {}
+    diag = {
+        'anchors': len(soup.select('a[href]')),
+        'onclick_nodes': len(soup.select('[onclick]')),
+        'data_link_nodes': len(soup.select('[data-href], [data-url]')),
+        'detail_links_found': 0,
+        'verified_items_found': 0,
+    }
+    allowed_host = {'ealimi.com', 'www.ealimi.com'}
+    for node in soup.select('a[href], [onclick], [data-href], [data-url]'):
+        attributes = [node.get('href', ''), node.get('onclick', ''),
+                      node.get('data-href', ''), node.get('data-url', '')]
+        possible_urls = []
+        for value in attributes:
+            if not isinstance(value, str):
+                continue
+            if value.strip().startswith(('https://', '/ReceivedNoti/')):
+                possible_urls.append(value.strip())
+            for match in EALIMI_EMBEDDED_URL.finditer(value.replace('&amp;', '&')):
+                possible_urls.append(match.group(1))
+        verified_url = None
+        for value in possible_urls:
+            # Remove JS string boundaries or trailing syntax without changing IDs.
+            value = value.split('\\n')[0].strip(' \"\'`;,')
+            url = urljoin(current_url, value)
+            parsed = urlparse(url)
+            if parsed.scheme == 'https' and parsed.hostname in allowed_host and EALIMI_DETAIL_PATH.match(parsed.path):
+                verified_url = url
+                break
+        if verified_url is None:
+            continue
+        diag['detail_links_found'] += 1
+        # Locate title from nearby notice card, not global navigation/header.
+        title = ' '.join(node.stripped_strings)
+        parent = node
+        for _ in range(4):
+            if title and title not in EALIMI_UTILITY_TEXT and len(title) >= 6:
+                break
+            parent = parent.parent
+            if parent is None or parent.name in ('body','html'):
+                break
+            for candidate in parent.select('[class*="title"], [class*="Title"], [class*="subject"], [class*="Subject"], [class*="tit"], [class*="Tit"]')[:6]:
+                t = ' '.join(candidate.stripped_strings)
+                if 6 <= len(t) <= 220 and t not in EALIMI_UTILITY_TEXT:
+                    title = t
+                    break
+            if title not in EALIMI_UTILITY_TEXT and len(title) >= 6:
+                break
+            if parent.name in ('li','article'):
+                t = ' '.join(parent.stripped_strings)
+                if 6 <= len(t) <= 220 and t not in EALIMI_UTILITY_TEXT:
+                    title = t
+                    break
+        title = re.sub(r'\s+', ' ', title).strip()[:220]
+        if title in EALIMI_UTILITY_TEXT or len(title) < 6:
+            continue
+        if any(x in title for x in ('로그인', '비밀번호 찾기', '회원가입', 'URL(주소) 복사')):
+            continue
+        # Read title/date from visible card only; do not open unread messages.
+        summary = ' '.join(parent.stripped_strings)[:500] if parent else title
+        dm = EALIMI_DATE.search(summary)
+        published = f'{dm[1]}-{int(dm[2]):02}-{int(dm[3]):02}' if dm else ''
+        path = urlparse(verified_url).path
+        qs = parse_qs(urlparse(verified_url).query)
+        nid = qs.get('l_id', [''])[0]
+        if not nid:
+            ids = re.findall(r'/([0-9]{5,})(?:/|$)', path)
+            nid = ids[-1] if ids else fingerprint(verified_url)
+        # Deduplicate same notice appearing in multiple homepage widgets.
+        results[nid] = {
+            'source': 'e알리미', 'notice_id': nid,
+            'title': title, 'published_at': published, 'url': verified_url,
+            'fingerprint': fingerprint(title, published, verified_url),
+            'attachment_urls': '',
+            'detail_status': 'LIST_ONLY;NO_UNREAD_OPEN',
+        }
+    diag['verified_items_found'] = len(results)
+    return list(results.values()), diag
+
 def collect_ealimi():
     """Read only the list rendered for an authorised user, without opening items.
 
@@ -160,13 +265,11 @@ def collect_ealimi():
                 message = dialog.message or ''
                 if dialog.type == 'confirm':
                     auth_diag['js_confirm_seen'] = True
-                    
                     if (
                         auth_diag.get('login_click_started', False)
                         and not auth_diag['force_login_accepted']
                         and urlparse(page.url).path.lower().rstrip('/') == '/member/signin'
                     ):
-
                         auth_diag['force_login_accepted'] = True
                         auth_diag['session_conflict_result'] = True
                         dialog.accept()
@@ -214,7 +317,6 @@ def collect_ealimi():
             username.fill(user)
             passwd.fill(password)
             auth_diag['login_click_started'] = True
-
             button = page.get_by_role('button', name=re.compile('로그인')).first
             if button.count():
                 button.click(timeout=15000)
@@ -304,96 +406,21 @@ def collect_ealimi():
                                 continue
                     if navigation_clicked:
                         break
-            
-            # Verify inbox using its URL, not its displayed title.
-            page.wait_for_timeout(3500)
-
+            # Check the authenticated route, not a fragile Korean menu label.
+            page.wait_for_timeout(3000)
             actual_path = urlparse(page.url).path.lower().rstrip('/')
-
             if actual_path.startswith('/member/signin'):
                 raise RuntimeError('EALIMI_AUTH_EXPIRED')
-
             if target:
                 expected_path = urlparse(target).path.lower().rstrip('/')
-                inbox_reached = (
-                    actual_path == expected_path
-                    or actual_path.startswith(expected_path + '/')
-                )
-
-                print('EALIMI_ROUTE_DIAG', json.dumps({
-                    'inbox_route_reached': inbox_reached,
-                    'redirected_to_main': actual_path.startswith('/main'),
-                    'login_route': actual_path.startswith('/member/signin'),
-                }))
-
+                inbox_reached = actual_path == expected_path or actual_path.startswith(expected_path + '/')
+                print('EALIMI_ROUTE_DIAG', json.dumps({'inbox_route_reached': inbox_reached}))
                 if not inbox_reached:
                     raise RuntimeError('EALIMI_INBOX_ROUTE_MISMATCH')
-
-            elif '받은알리미' not in page.locator('body').inner_text().replace(' ', ''):
-                raise RuntimeError('EALIMI_INBOX_NAVIGATION_UNVERIFIED')
-
-            soup = BeautifulSoup(page.content(), 'html.parser')
-            # Only consider rows/cards in list structures (do not open notices).
-            candidates = soup.select('table tbody tr, [class*="list"] li, [class*="List"] li, [class*="notice"] li, [class*="Notice"] li')
-            results = []
-            for el in candidates:
-                text = ' '.join(el.stripped_strings)
-                if len(text) < 9 or len(text) > 400:
-                    continue
-                if any(x in text for x in ['로그인', '비밀번호 찾기', '회원가입', '계정선택']):
-                    continue
-                a = el.select_one('a[href]')
-                href = urljoin(page.url, a.get('href', '')) if a else page.url
-                if not is_ealimi_url(href):
-                    continue
-                title = (a.get_text(' ', strip=True) if a else text)[:200]
-                if not title or len(title) < 4:
-                    continue
-                m = re.search(r'(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})', text)
-                date = f'{m[1]}-{int(m[2]):02}-{int(m[3]):02}' if m else ''
-                cls = ' '.join(el.get('class', [])) + ' ' + ' '.join(el.parent.get('class', []) if el.parent else [])
-                if not m and not re.search(r'alimi|receive|notice|list', cls, re.I):
-                    continue
-                
-                if title == 'URL(주소) 복사':
-
-                    continue
-
-                if (
-
-                    urlparse(href).path.lower().rstrip('/')
-
-                    == urlparse(page.url).path.lower().rstrip('/')
-
-                ):
-
-                    continue
-                uid = fingerprint(href, title, date)
-                results.append({'source': 'e알리미', 'notice_id': uid,
-                                'title': title, 'published_at': date, 'url': href,
-                                'fingerprint': fingerprint(text), 'attachment_urls': '',
-                                'detail_status': 'LIST_ONLY;NO_UNREAD_OPEN'})
-            # Dedupe and guard against treating unrelated homepage menus as announcements.
-            results = list({r['notice_id']: r for r in results}.values())
+            results, diagnostics = extract_verified_ealimi_notices(page.content(), page.url)
             if not results:
-                # Diagnostics are aggregate element COUNTS only. Never log HTML,
-                # notice text/titles, URLs, screenshots, member IDs or secrets.
-                structure = {
-                    'navigation_attempted': navigation_clicked,
-                    'login_button_present': bool(page.locator('#signInSubmitBtn').count()),
-                    'table_count': len(soup.select('table')),
-                    'table_body_rows': len(soup.select('table tbody tr')),
-                    'list_items': len(soup.select('li')),
-                    'article_count': len(soup.select('article')),
-                    'iframe_count': len(soup.select('iframe')),
-                    'link_count': len(soup.select('a[href]')),
-                    'candidate_nodes': len(candidates),
-                    'card_class_nodes': len(soup.select('[class*="card"], [class*="Card"]')),
-                    'item_class_nodes': len(soup.select('[class*="item"], [class*="Item"]')),
-                    'role_rows': len(soup.select('[role="row"]')),
-                }
-                print('EALIMI_STRUCTURE_COUNTS', json.dumps(structure, ensure_ascii=False))
-                raise RuntimeError('EALIMI_LAYOUT_UNVERIFIED (login may work; inbox list not recognised)')
+                print('EALIMI_LINK_DIAG', json.dumps(diagnostics))
+                raise RuntimeError('EALIMI_LAYOUT_UNVERIFIED (no confirmed notice detail links)')
             return results
         finally:
             context.close()
