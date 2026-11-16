@@ -61,7 +61,7 @@ jobs:
 
 
       - name: Verify parser
-        run: python -m pytest tests/test_notices.py tests/test_notice_enrich.py -q
+        run: python -m pytest tests/test_notices.py tests/test_notice_enrich.py tests/test_owner_backup.py -q
 
       - name: Collect notices (no private content in job output)
         run: python notice_sync.py
