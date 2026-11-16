@@ -41,7 +41,7 @@ jobs:
       NOTICE_UPLOAD_TOKEN: ${{ secrets.NOTICE_UPLOAD_TOKEN }}
       EALIMI_DETAIL_MAX_PER_RUN: ${{ vars.EALIMI_DETAIL_MAX_PER_RUN || '5' }}
       PUBLIC_DETAIL_MAX_PER_RUN: ${{ vars.PUBLIC_DETAIL_MAX_PER_RUN || '6' }}
-      RUN_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '5 9 * * *' && vars.EALIMI_SCHEDULE_ENABLED == 'true' && 'all' || 'school') || inputs.run_mode }}
+      RUN_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '5 9 * * *' && 'all' || 'school') || inputs.run_mode }}
 
     steps:
       - uses: actions/checkout@v4
