@@ -37,6 +37,8 @@ jobs:
       EALIMI_LIST_URL: ${{ secrets.EALIMI_LIST_URL }}
       NOTICE_ENRICH_ENABLED: ${{ vars.NOTICE_ENRICH_ENABLED || 'true' }}
       NOTICE_DRIVE_FOLDER_ID: ${{ secrets.NOTICE_DRIVE_FOLDER_ID }}
+      NOTICE_UPLOAD_WEBAPP_URL: ${{ secrets.NOTICE_UPLOAD_WEBAPP_URL }}
+      NOTICE_UPLOAD_TOKEN: ${{ secrets.NOTICE_UPLOAD_TOKEN }}
       EALIMI_DETAIL_MAX_PER_RUN: ${{ vars.EALIMI_DETAIL_MAX_PER_RUN || '5' }}
       PUBLIC_DETAIL_MAX_PER_RUN: ${{ vars.PUBLIC_DETAIL_MAX_PER_RUN || '6' }}
       RUN_MODE: ${{ github.event_name == 'schedule' && (github.event.schedule == '5 9 * * *' && vars.EALIMI_SCHEDULE_ENABLED == 'true' && 'all' || 'school') || inputs.run_mode }}
