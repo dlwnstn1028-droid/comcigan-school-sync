@@ -1,0 +1,5 @@
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+google-auth>=2.30,<3
+playwright>=1.55,<2
+pytest>=8,<10
